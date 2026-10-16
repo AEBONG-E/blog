@@ -1,0 +1,195 @@
+---
+title: "JVM 런타임 데이터 영역: 스레드별 영역과 공유 영역으로 보는 메모리 구조"
+slug: jvm-runtime-data-areas
+category: language
+subcategory: Java / Kotlin
+series: jvm
+seriesOrder: 1
+date: 2026-10-16
+updated: 2026-10-16
+status: 초안
+tags: [java, jvm, memory, heap, stack, metaspace]
+summary: "JVM 명세가 정의한 6가지 런타임 데이터 영역을 스레드별 영역과 공유 영역으로 나눠 정리하고, HotSpot의 Metaspace와 실무에서 만나는 OutOfMemoryError 유형까지 연결한다."
+readingTime: 12
+---
+
+## 들어가며
+
+Java 코드를 실행하면 JVM은 운영체제로부터 메모리를 받아 여러 영역으로 나눠 씁니다. 지역 변수는 어디에 있고, `new`로 만든 객체는 어디에 있으며, 클래스 정보는 어디에 저장될까요? 이 구분을 알아야 `StackOverflowError`와 `OutOfMemoryError`가 왜 나는지, `-Xss`와 `-Xmx`가 각각 무엇을 조절하는지 설명할 수 있습니다.
+
+이 글에서는 다음을 다룹니다.
+
+- JVM 명세(JVMS)가 정의한 6가지 런타임 데이터 영역
+- 영역을 스레드별 영역과 공유 영역으로 나누는 이유
+- 메서드 호출 한 번이 만드는 스택 프레임의 구조
+- HotSpot JVM에서 PermGen이 사라지고 Metaspace가 생긴 배경
+- 실무에서 만나는 메모리 오류를 영역과 연결해 읽는 법
+
+## 핵심 개념
+
+### 1. 6가지 영역을 두 그룹으로 나누기
+
+JVM 명세 2.5절은 런타임 데이터 영역을 6가지로 정의합니다. 가장 먼저 기억할 기준은 **스레드마다 따로 생기는가, 모든 스레드가 함께 쓰는가**입니다.
+
+| 영역 | 공유 여부 | 생성 시점 | 저장하는 것 |
+|---|---|---|---|
+| PC 레지스터 | 스레드별 | 스레드 생성 시 | 현재 실행 중인 JVM 명령어 주소 |
+| JVM 스택 | 스레드별 | 스레드 생성 시 | 메서드 호출마다 쌓이는 프레임 |
+| 네이티브 메서드 스택 | 스레드별(일반적) | 스레드 생성 시 | JNI 등 네이티브 메서드 실행 정보 |
+| 힙 | 전체 공유 | JVM 시작 시 | 객체 인스턴스, 배열 |
+| 메서드 영역 | 전체 공유 | JVM 시작 시 | 클래스 구조, 메서드 코드, 필드 정보 |
+| 런타임 상수 풀 | 클래스별 (메서드 영역 안) | 클래스 생성 시 | 상수, 메서드·필드 참조 |
+
+왜 이렇게 나누는가: 스레드별 영역은 다른 스레드와 공유하지 않으므로 동기화 없이 빠르게 쓸 수 있고, 스레드가 끝나면 함께 사라집니다. 반대로 *공유 영역은 여러 스레드가 동시에 접근하므로 동시성 문제와 GC의 대상*이 됩니다.
+
+### 2. JVM 스택과 프레임: 메서드 호출의 단위
+
+메서드를 호출할 때마다 JVM 스택에 **프레임**(Frame)이 하나 쌓이고, 메서드가 끝나면(정상 종료든 예외든) 제거됩니다. 명세 2.6절에 따르면 프레임은 다음으로 구성됩니다.
+
+- 지역 변수 배열: 매개변수와 지역 변수. 크기는 컴파일 시점에 정해진다
+- 피연산자 스택: 연산 중간값을 올려두는 LIFO 스택. 최대 깊이도 컴파일 시점에 정해진다
+- 현재 클래스의 런타임 상수 풀 참조: 동적 링크에 사용
+
+왜 이렇게 하는가: 크기가 미리 정해져 있어서 프레임 메모리를 호출 시점에 한 번에 할당할 수 있습니다. 그리고 *재귀가 너무 깊어 스택 한도를 넘으면* `StackOverflowError`가 납니다.
+
+### 3. 힙: 객체가 사는 곳, GC가 관리하는 곳
+
+`new`로 만든 객체와 배열은 **힙**에 할당됩니다. 지역 변수에 들어 있는 것은 객체 자체가 아니라 힙에 있는 객체를 가리키는 참조입니다. 명세는 힙의 객체를 프로그램이 직접 해제하지 않고 자동 메모리 관리(GC)가 회수한다고만 정하고, *어떤 GC 방식을 쓸지는 구현에 맡깁니다.*
+
+왜 이렇게 하는가: 객체의 수명은 메서드 호출보다 길 수 있어서 스택처럼 호출 종료와 함께 지울 수 없습니다. 그래서 공유 영역에 두고, 더 이상 참조되지 않을 때 GC가 회수합니다. GC가 공간을 확보하지 못하면 `OutOfMemoryError`가 납니다.
+
+<!-- 확인 필요: HotSpot의 Escape Analysis와 스칼라 치환으로 일부 객체가 힙에 할당되지 않을 수 있다는 점을 다룰지, 다룬다면 적용 조건과 출처 확인 -->
+
+### 4. 메서드 영역과 런타임 상수 풀
+
+**메서드 영역**에는 클래스별 구조 정보(런타임 상수 풀, 필드·메서드 정보, 메서드 바이트코드)가 저장됩니다. 명세는 메서드 영역을 "논리적으로 힙의 일부"라고 설명하지만, 위치나 GC 여부는 구현에 맡깁니다.
+
+**런타임 상수 풀**은 클래스 파일의 상수 풀이 실행 시점에 클래스마다 만들어진 형태입니다. 리터럴 상수뿐 아니라 실행 중에 실제 주소로 바뀌는(링크되는) 메서드·필드 참조도 담고 있습니다.
+
+왜 이렇게 하는가: 클래스 정보는 모든 스레드가 같은 것을 공유해야 하므로 공유 영역에 둡니다. 명세가 위치를 강제하지 않기 때문에 다음 절처럼 JVM 구현마다, 버전마다 실제 배치가 달라질 수 있습니다.
+
+### 5. HotSpot의 변화: PermGen에서 Metaspace로
+
+HotSpot JVM은 예전에 클래스 메타데이터를 힙과 이어진 **PermGen**(Permanent Generation)에 두었고, 크기를 `-XX:MaxPermSize`로 제한했습니다. JDK 8에서 PermGen이 제거되고 클래스 메타데이터는 네이티브 메모리의 **Metaspace**로 옮겨졌습니다(JEP 122). 이 과정에서 intern된 문자열과 클래스의 정적 변수는 Java 힙으로 옮겨졌습니다.
+
+- `MaxMetaspaceSize` 기본값은 제한 없음이며, 필요하면 `-XX:MaxMetaspaceSize`로 상한을 둔다
+- 클래스 메타데이터는 해당 클래스가 언로드될 때(클래스 로더가 GC될 때) 해제된다
+- 압축 클래스 포인터를 쓰면 별도의 Compressed Class Space(기본 1GB, `CompressedClassSpaceSize`)가 생긴다
+
+왜 이렇게 하는가: PermGen은 크기를 미리 정해야 해서 클래스를 많이 로드하는 애플리케이션에서 튜닝이 어려웠습니다. 클래스 메타데이터를 네이티브 메모리로 옮기면서 *고정 크기 제약은 사라졌지만, 상한을 두지 않으면 네이티브 메모리를 계속 쓸 수 있다*는 점을 기억해야 합니다.
+
+<!-- 확인 필요: intern 문자열의 힙 이동이 정확히 JDK 7에서 먼저 이루어졌는지 릴리스 노트로 확인 -->
+
+## 동작 살펴보기
+
+아래 코드는 영역별로 무엇이 어디에 놓이는지 보여주는 예시입니다.
+
+```java
+public class Order {
+    private static int created = 0;        // 정적 변수: JDK 8+ HotSpot 기준 힙 (클래스 미러와 함께)
+    private final String id;               // 인스턴스 필드: 객체와 함께 힙
+
+    public Order(String id) {
+        this.id = id;
+        created++;
+    }
+
+    public static void main(String[] args) {
+        int count = 3;                      // 지역 변수(기본형): main 프레임의 지역 변수 배열
+        Order order = new Order("A-1");     // 참조 order는 스택, Order 객체는 힙
+        String label = "order";             // 리터럴: 상수 풀 -> intern된 String 객체는 힙
+        System.out.println(order.id + count + label);
+    }
+}
+```
+
+<!-- 확인 필요: 정적 변수가 HotSpot에서 java.lang.Class 객체(클래스 미러)와 함께 힙에 놓인다는 설명의 출처 확인 -->
+
+메모리 오류는 어느 영역이 부족한지에 따라 메시지가 다릅니다.
+
+| 증상 | 관련 영역 | 주요 옵션 |
+|---|---|---|
+| `java.lang.StackOverflowError` | JVM 스택 (스레드별) | `-Xss` (스레드 스택 크기) |
+| `OutOfMemoryError: Java heap space` | 힙 | `-Xms`, `-Xmx` |
+| `OutOfMemoryError: Metaspace` | Metaspace (HotSpot) | `-XX:MaxMetaspaceSize` |
+| `OutOfMemoryError: unable to create native thread` | 네이티브 메모리, OS 스레드 한도 | 스레드 수, `-Xss`, OS 설정 |
+
+<!-- 확인 필요: 위 OutOfMemoryError 메시지 문구를 현재 LTS JDK에서 실제로 재현해 확인 -->
+
+> 시각화 제안: 6개 영역을 "스레드별 / 공유"로 나눠 보여주는 비교 토글형 컴포넌트, 또는 메서드 호출에 따라 프레임이 쌓이고 사라지는 단계 진행형 컴포넌트가 잘 맞습니다. 구현은 별도 요청 시 진행합니다.
+
+## 실무 관점
+
+- **힙만 보면 안 되는 경우:** 컨테이너 메모리 제한에 걸려 프로세스가 종료될 때, 원인이 힙이 아니라 Metaspace, 스레드 스택, 다이렉트 버퍼 같은 네이티브 메모리인 경우가 있습니다. *프로세스 전체 메모리 = 힙 + 힙 밖의 메모리*라고 생각해야 합니다.
+- **스레드 수와 스택 크기:** 스레드마다 스택이 따로 잡히므로, 스레드를 아주 많이 만드는 구조에서는 `-Xss`와 스레드 수가 전체 메모리에 영향을 줍니다. 스레드 풀로 수를 제한하는 이유 중 하나입니다.
+- **Metaspace 누수 패턴:** 클래스를 동적으로 생성하거나, 클래스 로더를 반복해서 만드는 환경(재배포를 반복하는 애플리케이션 서버 등)에서 이전 클래스 로더가 참조로 남으면 클래스가 언로드되지 않아 Metaspace가 계속 늘어납니다.
+- **진단 도구:** 힙은 힙 덤프(`jcmd <pid> GC.heap_dump`)로, 힙 밖의 메모리는 Native Memory Tracking(`-XX:NativeMemoryTracking=summary` 실행 후 `jcmd <pid> VM.native_memory summary`)으로 나눠 보는 것이 출발점입니다.
+
+<!-- 확인 필요: jcmd 명령 이름과 NMT 옵션을 현재 LTS JDK 문서 기준으로 확인 -->
+
+## 직접 해본 것
+
+<!-- TODO: 직접 확인 -->
+
+실험 과제 제안:
+
+1. 끝나지 않는 재귀 메서드로 `StackOverflowError`를 낸 뒤, `-Xss` 값을 바꿔 가며 재귀 깊이가 어떻게 달라지는지 기록해 본다.
+2. `-Xmx64m`으로 실행하고 리스트에 큰 배열을 계속 추가해 `Java heap space` 오류를 재현한 뒤, 힙 덤프를 떠서 어떤 객체가 메모리를 차지했는지 확인해 본다.
+3. `-XX:NativeMemoryTracking=summary`로 실행한 애플리케이션에서 `jcmd`로 힙, Class(Metaspace), Thread 항목의 크기를 비교해 본다.
+
+## 정리
+
+- JVM 런타임 데이터 영역은 6가지이고, 스레드별 영역(PC 레지스터, JVM 스택, 네이티브 메서드 스택)과 공유 영역(힙, 메서드 영역)으로 나뉜다.
+- 메서드 호출마다 JVM 스택에 프레임이 쌓이고, 프레임은 지역 변수 배열, 피연산자 스택, 상수 풀 참조로 구성된다.
+- 객체와 배열은 힙에 할당되고 GC가 회수한다. 명세는 GC 방식을 정하지 않는다.
+- 메서드 영역의 실제 위치는 구현에 따라 다르며, HotSpot은 JDK 8부터 클래스 메타데이터를 네이티브 메모리의 Metaspace에 둔다.
+- 메모리 오류는 메시지로 어느 영역이 부족한지 구분하고, 그 영역에 맞는 옵션과 도구로 접근한다.
+
+## 면접으로 연결하기
+
+### 질문이 나오는 흐름
+
+- "Java 프로그램이 실행되는 과정을 설명해 주세요" -> 클래스 로딩 다음으로 "로드된 클래스와 객체는 메모리 어디에 저장되나요?"
+- "GC가 무엇인가요?" -> "GC는 어느 메모리 영역을 대상으로 하나요?" -> 힙과 공유 영역
+- "OutOfMemoryError를 겪어 본 적이 있나요?" -> 오류 메시지로 영역을 구분하는 방법
+- "스레드를 많이 만들면 어떤 문제가 생기나요?" -> 스레드별 스택 메모리
+
+### 대표 질문과 답변 골격
+
+> JVM의 메모리 구조를 설명해 주세요. Stack과 Heap에는 각각 무엇이 저장되나요?
+
+답변에 들어갈 핵심 포인트:
+
+- 스레드별 영역(PC 레지스터, JVM 스택, 네이티브 메서드 스택)과 공유 영역(힙, 메서드 영역)으로 나뉜다
+- 스택에는 메서드 호출마다 프레임이 쌓이고 지역 변수와 참조가 들어간다
+- 힙에는 객체와 배열이 들어가고 GC가 회수한다
+- HotSpot은 JDK 8부터 클래스 메타데이터를 Metaspace(네이티브 메모리)에 둔다
+
+<!-- TODO: 직접 확인 - 위 포인트를 내 말로 30초 분량 답변으로 정리하기 -->
+
+### 예상 꼬리질문
+
+1. 지역 변수로 선언한 객체는 스택에 있나요, 힙에 있나요? -> 참조는 스택 프레임에, 객체는 힙에
+2. PermGen과 Metaspace의 차이는? -> 힙과 이어진 고정 크기 영역에서 네이티브 메모리로, 기본 상한 없음, `MaxMetaspaceSize`
+3. StackOverflowError와 OutOfMemoryError의 차이는? -> 스레드 스택 한도 초과 vs 힙·Metaspace 등 공유 영역 확보 실패
+4. 정적 변수는 어디에 저장되나요? -> 명세상 메서드 영역 개념, HotSpot JDK 8 이후 실제로는 힙 (확인 필요 표시 참고)
+5. 컨테이너에서 힙을 넉넉히 줬는데도 메모리 초과로 종료되는 이유는? -> 힙 밖의 네이티브 메모리(Metaspace, 스레드 스택 등)
+
+### 스스로 점검
+
+- [ ] 6가지 영역을 스레드별 / 공유로 나눠 말할 수 있다
+- [ ] 프레임의 구성 요소 3가지를 말할 수 있다
+- [ ] "명세가 정한 것"과 "HotSpot 구현"을 구분해서 설명할 수 있다
+- [ ] OutOfMemoryError 메시지를 보고 어느 영역 문제인지 말할 수 있다
+
+## 연계 학습
+
+- **선행:** Java 컴파일과 실행 과정(소스 -> 바이트코드 -> JVM), 기본형과 참조형의 차이
+- **심화:** 클래스 로더와 클래스 로딩 과정, GC 알고리즘과 세대별 힙 구조(G1, ZGC), JIT 컴파일과 Escape Analysis, Java 메모리 모델(JMM)과 가시성
+
+## 참고 자료
+
+- [The Java Virtual Machine Specification, Java SE 21 Edition - 2.5 Run-Time Data Areas](https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html#jvms-2.5) - 6가지 영역의 정의, 공유 여부, 예외 조건
+- [The Java Virtual Machine Specification, Java SE 21 Edition - Chapter 2](https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html) - 2.6 프레임 구조
+- [JEP 122: Remove the Permanent Generation](https://openjdk.org/jeps/122) - PermGen 제거, 클래스 메타데이터의 네이티브 메모리 이동
+- [HotSpot Virtual Machine Garbage Collection Tuning Guide (Java SE 8) - Other Considerations](https://docs.oracle.com/javase/8/docs/technotes/guides/vm/gctuning/considerations.html) - Class Metadata, MaxMetaspaceSize, CompressedClassSpaceSize
